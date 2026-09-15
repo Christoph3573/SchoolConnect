@@ -260,7 +260,7 @@ func (p *Plugin) Functions() []domain.Function {
 		},
 		{
 			Name:        "details",
-			Description: "Lehrplan-Seite laden (URL aus search). Liefert Inhaltsverzeichnis + Abschnitte mit Kompetenzerwartungen, strukturiert pro Lernbereich/Unterpunkt.",
+			Description: "Lehrplan-Seite laden (URL aus search). Liefert Inhaltsverzeichnis + Abschnitte mit Kompetenzerwartungen plus Halbjahr-Check (ob die Seite 13/1 vs. 13/2 unterscheidet).",
 			Params: []domain.Param{
 				{Name: "url", Description: "Ergebnis-URL aus search (relativ oder absolut).", Required: true},
 				{Name: "abschnitt", Description: "Optional: nur passende Abschnitte (Code wie '1.1' oder Titelstichwort wie 'Sprechen')."},
@@ -532,8 +532,95 @@ func (p *Plugin) details(ctx context.Context, args map[string]string) (any, erro
 		"inhaltsverzeichnis": inhalt,
 		"abschnitte_count":   len(abschnitte),
 		"abschnitte":         abschnitte,
+		"halbjahr":           checkHalbjahr(page),
 		"kurz":               kurz,
 	}, nil
+}
+
+// halbjahrMuster sucht seitenweit nach Halbjahr-/Semester-Gliederung
+// (z.B. "13/1", "13.1", "1. Halbjahr", "Semester"). Treffer im SVG-Logo
+// (CSS-Pfade wie "h2.49c...") werden ausgeschlossen, indem nur Text
+// außerhalb von <style>/<script>/<svg> und Attributen zählt.
+var halbjahrMuster = regexp.MustCompile(`(?i)(halbjahr|semester|\b1\.\s*halbjahr|\b2\.\s*halbjahr|13\s*/\s*1|13\s*/\s*2|13\.1|13\.2|erstes\s+halbjahr|zweites\s+halbjahr)`)
+
+// checkHalbjahr prüft, ob die Seite nach Halbjahren gliedert, und meldet
+// Fundstellen (Textkontext) zurück — damit "erstes Halbjahr" beantwortbar ist,
+// ohne die Seite manuell mit curl/grep zu durchsuchen.
+func checkHalbjahr(page string) map[string]any {
+	// Rauschen entfernen: Skripte, Styles, SVGs, Dialoge, Bilder.
+	// (RE2/go-regexp kennt keine Rückreferenzen, daher je Tag einzeln.)
+	strip := page
+	for _, tag := range []string{"script", "style", "svg", "dialog"} {
+		strip = regexp.MustCompile(`(?s)<`+tag+`[^>]*>.*?</`+tag+`>`).ReplaceAllString(strip, " ")
+	}
+	strip = imgRe.ReplaceAllString(strip, " ")
+	text := cleanText(strip)
+	funde := []string{}
+	for _, m := range halbjahrMuster.FindAllStringSubmatch(text, -1) {
+		treffer := strings.TrimSpace(m[0])
+		if treffer == "" {
+			continue
+		}
+		i := strings.Index(text, treffer)
+		von := max(0, i-80)
+		bis := min(len(text), i+len(treffer)+80)
+		ctx := strings.TrimSpace(text[von:bis])
+		dup := false
+		for _, f := range funde {
+			if f == ctx {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			funde = append(funde, ctx)
+		}
+		if len(funde) >= 10 {
+			break
+		}
+	}
+	return map[string]any{
+		"gefunden":     len(funde) > 0,
+		"treffer":      len(funde),
+		"fundstellen":  funde,
+		"gliederung":   jahrgangsGliederung(text),
+		"halbjahr_13_1": filterHalbjahrAbschnitte(text, "13/1", "13.1", "erstes halbjahr", "1. halbjahr"),
+	}
+}
+
+// jahrgangsGliederung erkennt, wonach die Seite gliedert (Jahrgang vs. Halbjahr).
+func jahrgangsGliederung(text string) string {
+	if halbjahrMuster.MatchString(text) {
+		return "halbjahr"
+	}
+	if regexp.MustCompile(`(?i)(jahrgangsstufe|jahrgang|klasse)`).MatchString(text) {
+		return "jahrgang"
+	}
+	return "unbekannt"
+}
+
+// filterHalbjahrAbschnitte sucht Textblöcke, die explizit 13/1 zugeordnet sind.
+func filterHalbjahrAbschnitte(text string, marker ...string) []string {
+	out := []string{}
+	lower := strings.ToLower(text)
+	for _, mk := range marker {
+		idx := 0
+		for {
+			i := strings.Index(lower[idx:], strings.ToLower(mk))
+			if i < 0 {
+				break
+			}
+			i += idx
+			von := max(0, i-200)
+			bis := min(len(text), i+len(mk)+200)
+			out = append(out, strings.TrimSpace(text[von:bis]))
+			idx = i + len(mk)
+			if len(out) >= 5 {
+				return out
+			}
+		}
+	}
+	return out
 }
 
 // tocEntry ist ein Eintrag im Inhaltsverzeichnis (#flyer).
