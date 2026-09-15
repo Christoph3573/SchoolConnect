@@ -2,11 +2,12 @@
 // ein MCP-Tool mit Namen "<plugin>_<funktion>" (Bindestriche -> Unterstriche).
 //
 // Transport: JSON-RPC 2.0 über stdio (für Claude Desktop / MCP-Clients):
-//   -> {"jsonrpc":"2.0","id":1,"method":"tools/list"}
-//   <- {"jsonrpc":"2.0","id":1,"result":{"tools":[...]}}
-//   -> {"jsonrpc":"2.0","id":2,"method":"tools/call",
-//       "params":{"name":"lernplan_search","arguments":{"query":"..."}}}
-//   <- {"jsonrpc":"2.0","id":2,"result":{...}}
+//
+//	-> {"jsonrpc":"2.0","id":1,"method":"tools/list"}
+//	<- {"jsonrpc":"2.0","id":1,"result":{"tools":[...]}}
+//	-> {"jsonrpc":"2.0","id":2,"method":"tools/call",
+//	    "params":{"name":"lernplan_search","arguments":{"query":"..."}}}
+//	<- {"jsonrpc":"2.0","id":2,"result":{...}}
 package mcp
 
 import (

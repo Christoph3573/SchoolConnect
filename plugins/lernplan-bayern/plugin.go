@@ -30,9 +30,14 @@ type Plugin struct {
 // New erzeugt das Plugin (Core stellt den HTTP-Client).
 func New(client *http.Client) *Plugin { return &Plugin{client: client} }
 
-func (p *Plugin) ID() string          { return "lernplan-bayern" }
-func (p *Plugin) Name() string        { return "Lernplan Bayern" }
-func (p *Plugin) Description() string { return "LehrplanPLUS Bayern: Fachlehrpläne, Fachprofile und Kompetenzen suchen." }
+func (p *Plugin) ID() string   { return "lernplan-bayern" }
+func (p *Plugin) Name() string { return "Lernplan Bayern" }
+func (p *Plugin) Description() string {
+	return "LehrplanPLUS Bayern: Fachlehrpläne, Fachprofile und Kompetenzen suchen."
+}
+
+// AuthParams: öffentliche Inhalte, kein Login nötig.
+func (p *Plugin) AuthParams() []domain.Param { return nil }
 
 func (p *Plugin) Authenticate(_ context.Context, credentials map[string]string) error {
 	// Öffentliche Inhalte: kein Login nötig; Methode bleibt für Einheitlichkeit.
@@ -47,15 +52,15 @@ func (p *Plugin) Authenticate(_ context.Context, credentials map[string]string) 
 const baseURL = "https://www.lehrplanplus.bayern.de"
 
 var schulartByName = map[string]string{
-	"grundschule":    "24427",
-	"mittelschule":   "24428",
-	"förderschule":   "24429",
-	"foerderschule":  "24429",
-	"realschule":     "24430",
-	"gymnasium":      "24431",
+	"grundschule":       "24427",
+	"mittelschule":      "24428",
+	"förderschule":      "24429",
+	"foerderschule":     "24429",
+	"realschule":        "24430",
+	"gymnasium":         "24431",
 	"wirtschaftsschule": "24432",
-	"fachoberschule": "43644",
-	"berufsoberschule": "43645",
+	"fachoberschule":    "43644",
+	"berufsoberschule":  "43645",
 }
 
 var schulartByID = map[string]string{
@@ -580,10 +585,10 @@ func checkHalbjahr(page string) map[string]any {
 		}
 	}
 	return map[string]any{
-		"gefunden":     len(funde) > 0,
-		"treffer":      len(funde),
-		"fundstellen":  funde,
-		"gliederung":   jahrgangsGliederung(text),
+		"gefunden":      len(funde) > 0,
+		"treffer":       len(funde),
+		"fundstellen":   funde,
+		"gliederung":    jahrgangsGliederung(text),
 		"halbjahr_13_1": filterHalbjahrAbschnitte(text, "13/1", "13.1", "erstes halbjahr", "1. halbjahr"),
 	}
 }
@@ -719,7 +724,7 @@ func parseAbschnitte(page string) []any {
 		// Text aus Absätzen hat Vorrang; Kompetenzen bleiben separat.
 		text := strings.Join(textParts, "\n")
 
-	var uebergeordnet string
+		var uebergeordnet string
 		if ebene == "2" {
 			titel = heading // Lernbereichs-Titel vollständig behalten ("D9 Lernbereich 1: ...")
 			code = ""
@@ -730,7 +735,7 @@ func parseAbschnitte(page string) []any {
 		out = append(out, map[string]any{
 			"id": id, "ebene": ebene, "code": code, "titel": titel,
 			"uebergeordnet": uebergeordnet,
-			"text": text, "kompetenzen": kompetenzen,
+			"text":          text, "kompetenzen": kompetenzen,
 		})
 	}
 	return out

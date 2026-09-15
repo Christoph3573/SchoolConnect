@@ -21,6 +21,9 @@ func (p *Plugin) ID() string          { return "mebis" }
 func (p *Plugin) Name() string        { return "mebis" }
 func (p *Plugin) Description() string { return "Kurse, Aufgaben und Lernmaterialien aus mebis." }
 
+// AuthParams: derzeit kein Login nötig (Stub).
+func (p *Plugin) AuthParams() []domain.Param { return nil }
+
 func (p *Plugin) Authenticate(_ context.Context, credentials map[string]string) error {
 	// TODO: mebis-Login (SSO), Token cachen.
 	if t, ok := credentials["token"]; ok {

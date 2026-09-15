@@ -75,12 +75,59 @@ MCP-Beispiel (`tools/call`):
 | Plugin | ID | Status | Funktionen |
 |---|---|---|---|
 | Lernplan Bayern (LehrplanPLUS) | `lernplan-bayern` | ✅ live (echter Web-Zugriff) | `search`, `details` |
-| Schülerportal | `schuelerportal` | Stub | `profile`, `grades` |
+| Schülerportal | `schuelerportal` | ✅ live (Login: `auth`) | `auth`, `logout`, `profil`, `stundenplan`, `hausaufgaben`, `vertretungsplan` |
 | mebis | `mebis` | Stub | `courses`, `tasks` |
 | ByCS Drive | `bycs-drive` | Stub | `list`, `search` |
 | ByCS Messenger | `bycs-messenger` | Stub | `chats`, `send` |
 
-Secrets per Plugin via Env: `<ID>_SECRET` (`-`→`_`), siehe `config.SecretFor(pluginID)`. Keine Secrets im Code.
+## Auth (einmal anmelden, überall angemeldet)
+
+Plugins mit Login deklarieren `AuthParams()` (z.B. `schule`/`username`/`password`);
+die Runtime generiert daraus automatisch `<plugin>.auth` + `<plugin>.logout` —
+identisch in CLI, REST und MCP. Erfolgreiche Logins landen in
+`~/.config/schoolconnect/credentials.json` (0600, via `SCHOOLCONNECT_CONFIG_DIR`
+umleitbar) und werden bei jedem Call automatisch injiziert. Datenfunktionen
+brauchen daher keine Credential-Params. Quelle der Credentials, aufsteigend:
+Param-Defaults < Store < Env (`SCHUELERPORTAL_SECRET`, Format parst das Plugin)
+< explizite Parameter.
+
+```bash
+# Interaktiv (fehlende Pflichtwerte werden abgefragt, Passwort ohne Echo):
+/tmp/schoolconnect auth schuelerportal
+# oder direkt:
+/tmp/schoolconnect auth schuelerportal --schule indomagy --username ich@mail --password geheim
+# prüfen (Antwort enthält nur Key-Namen, nie Secret-Werte):
+/tmp/schoolconnect tool schuelerportal profil
+# abmelden:
+/tmp/schoolconnect logout schuelerportal        # = tool schuelerportal logout
+```
+
+REST und MCP nutzen denselben Flow ohne Adapter-Sondercode:
+
+```bash
+curl -X POST localhost:8080/api/schuelerportal/auth \
+  -H 'Content-Type: application/json' \
+  -d '{"schule":"indomagy","username":"ich@mail","password":"geheim"}'
+curl 'localhost:8080/api/schuelerportal/stundenplan?tag=mo'
+```
+
+```json
+{"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+ "params": {"name": "schuelerportal_auth",
+  "arguments": {"schule": "indomagy", "username": "ich@mail", "password": "geheim"}}}
+```
+
+### schuelerportal: Schülerportal-Zugriff
+
+Echter Zugriff auf `https://api.schueler.schule-infoportal.de/<schule>/…`
+(Laravel-Sanctum-XSRF-Flow, aus HAR-Mitschnitt rekonstruiert). `schule` ist das
+Schulkürzel im API-Pfad. Nach `auth` genügen:
+
+```bash
+/tmp/schoolconnect tool schuelerportal stundenplan --tag mo
+/tmp/schoolconnect tool schuelerportal hausaufgaben
+/tmp/schoolconnect tool schuelerportal vertretungsplan --datum 2026-09-15
+```
 
 ### lernplan-bayern: LehrplanPLUS-Suche
 
@@ -115,9 +162,9 @@ Kapitel-Filterlogik (aus `data-usable` in `/wizard`): `kap4` nutzt alle Filter, 
 
 ## Neues Plugin / neue Funktion
 
-1. Vorlage kopieren (Referenz: `plugins/lernplan-bayern/plugin.go`).
-2. `ID()`, `Name()`, `Description()`, `Functions()`, `Authenticate()` implementieren.
-3. Nur `Params` mit `Name/Description/Required/Default` deklarieren — Adapter generieren sich daraus.
+1. Vorlage kopieren (Referenz: `plugins/lernplan-bayern/plugin.go`; mit Login: `plugins/schuelerportal/plugin.go`).
+2. `ID()`, `Name()`, `Description()`, `Functions()`, `Authenticate()` implementieren — mit Login zusätzlich `AuthParams()` + optional `EnvCredentials()` (Format parst das Plugin; Core bleibt generisch).
+3. Nur `Params` mit `Name/Description/Required/Default/Aliases/Secret` deklarieren — Adapter generieren sich daraus. Credential-Params gehören nur in `AuthParams()`, nie an Datenfunktionen.
 4. Handler gibt plain `any` zurück, Fehler als `error` (Core mappt auf Codes/HTTP-Status).
 5. Eine Zeile in `cmd/schoolconnect/main.go`: `rt.Register(<neu>.New(hc))`. Sonst nichts ändern.
 

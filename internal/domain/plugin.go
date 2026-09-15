@@ -12,6 +12,13 @@ type Param struct {
 	Description string
 	Required    bool
 	Default     string
+	// Aliases sind alternative Schreibweisen (z.B. "email" für "username").
+	// Alle Adapter akzeptieren sie, gespeichert wird der kanonische Name.
+	Aliases []string
+	// Secret markiert sensible Werte (Passwörter, Tokens): Sie werden
+	// in Hilfe/Listings maskiert, nie geloggt und vom Session-Store
+	// nur mit 0600-Rechten abgelegt.
+	Secret bool
 }
 
 // Function ist eine einzelne Plugin-Funktion.
@@ -66,6 +73,23 @@ type Plugin interface {
 	Description() string
 	// Functions listet alle exponierten Funktionen des Plugins.
 	Functions() []Function
+	// AuthParams deklariert, welche Credentials Authenticate() braucht
+	// (z.B. schule/username/password). Die Runtime generiert daraus
+	// automatisch eine "auth"-Funktion (CLI/REST/MCP) — Plugins müssen
+	// keine eigene auth-Funktion mehr definieren. Nil = kein Login nötig
+	// (öffentliche Inhalte).
+	AuthParams() []Param
 	// Authenticate baut eine Session für das Plugin auf (kann Stub sein).
+	// Credentials kommen von der Runtime: gespeicherte Session +
+	// aufrufseitige Args (Args gewinnen).
 	Authenticate(ctx context.Context, credentials map[string]string) error
+}
+
+// EnvCredentialsProvider kann ein Plugin optional zusätzlich
+// implementieren, um Credentials aus Umgebungsvariablen beizusteuern
+// (z.B. SCHUELERPORTAL_SECRET). Die Runtime mischt sie beim Merge mit:
+// Defaults < Store < Env < Args. Core bleibt generisch — das Format
+// parst das Plugin selbst.
+type EnvCredentialsProvider interface {
+	EnvCredentials() map[string]string
 }

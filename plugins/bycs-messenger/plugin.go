@@ -21,6 +21,9 @@ func (p *Plugin) ID() string          { return "bycs-messenger" }
 func (p *Plugin) Name() string        { return "ByCS Messenger" }
 func (p *Plugin) Description() string { return "Chats und Nachrichten aus dem ByCS Messenger." }
 
+// AuthParams: derzeit kein Login nötig (Stub).
+func (p *Plugin) AuthParams() []domain.Param { return nil }
+
 func (p *Plugin) Authenticate(_ context.Context, credentials map[string]string) error {
 	// TODO: Matrix-/Messenger-Login, Token cachen.
 	if t, ok := credentials["token"]; ok {

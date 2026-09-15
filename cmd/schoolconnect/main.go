@@ -1,10 +1,11 @@
 // Command schoolconnect: einheitliche Schnittstelle zu bayerischen Schulplattformen.
 //
 // Modi (alle nutzen dieselbe Plugin Runtime):
-//   schoolconnect list                              alle Funktionen auflisten
-//   schoolconnect tool <plugin> <func> [--p v ...] Funktion via CLI aufrufen
-//   schoolconnect serve                             REST-API starten (:8080 / REST_ADDR)
-//   schoolconnect mcp                               MCP-Server via stdio (JSON-RPC)
+//
+//	schoolconnect list                              alle Funktionen auflisten
+//	schoolconnect tool <plugin> <func> [--p v ...] Funktion via CLI aufrufen
+//	schoolconnect serve                             REST-API starten (:8080 / REST_ADDR)
+//	schoolconnect mcp                               MCP-Server via stdio (JSON-RPC)
 package main
 
 import (
