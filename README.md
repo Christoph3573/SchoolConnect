@@ -78,7 +78,6 @@ MCP-Beispiel (`tools/call`):
 | Schülerportal | `schuelerportal` | ✅ live (Login: `auth`) | `auth`, `logout`, `profil`, `stundenplan`, `hausaufgaben`, `vertretungsplan` |
 | mebis | `mebis` | Stub | `courses`, `tasks` |
 | ByCS Drive | `bycs-drive` | Stub | `list`, `search` |
-| ByCS Messenger | `bycs-messenger` | Stub | `chats`, `send` |
 
 ## Auth (einmal anmelden, überall angemeldet)
 

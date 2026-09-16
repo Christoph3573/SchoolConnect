@@ -23,7 +23,6 @@ import (
 	"schoolconnect/internal/core/logging"
 
 	bycsdrive "schoolconnect/plugins/bycs-drive"
-	bycsmessenger "schoolconnect/plugins/bycs-messenger"
 	lernplanbayern "schoolconnect/plugins/lernplan-bayern"
 	"schoolconnect/plugins/mebis"
 	"schoolconnect/plugins/schuelerportal"
@@ -40,7 +39,6 @@ func main() {
 	rt.Register(schuelerportal.New(hc))
 	rt.Register(mebis.New(hc))
 	rt.Register(bycsdrive.New(hc))
-	rt.Register(bycsmessenger.New(hc))
 	rt.Register(lernplanbayern.New(hc))
 
 	if len(os.Args) > 1 {
