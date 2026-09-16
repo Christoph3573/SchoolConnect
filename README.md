@@ -76,8 +76,8 @@ MCP-Beispiel (`tools/call`):
 |---|---|---|---|
 | Lernplan Bayern (LehrplanPLUS) | `lernplan-bayern` | ✅ live (echter Web-Zugriff) | `search`, `details` |
 | Schülerportal | `schuelerportal` | ✅ live (Login: `auth`) | `auth`, `logout`, `profil`, `stundenplan`, `hausaufgaben`, `vertretungsplan` |
-| mebis | `mebis` | Stub | `courses`, `tasks` |
-| ByCS Drive | `bycs-drive` | Stub | `list`, `search` |
+| mebis (ByCS-Lernplattform, Moodle) | `mebis` | ✅ live (Login: `auth`) | `auth`, `logout`, `courses`, `abschnitte`, `inhalt`, `fetch` |
+| ByCS Drive (Dateicloud, OCIS) | `bycs-drive` | ✅ live (Login: `auth`) | `auth`, `logout`, `spaces`, `list`, `fetch` |
 
 ## Auth (einmal anmelden, überall angemeldet)
 
@@ -87,8 +87,9 @@ identisch in CLI, REST und MCP. Erfolgreiche Logins landen in
 `~/.config/schoolconnect/credentials.json` (0600, via `SCHOOLCONNECT_CONFIG_DIR`
 umleitbar) und werden bei jedem Call automatisch injiziert. Datenfunktionen
 brauchen daher keine Credential-Params. Quelle der Credentials, aufsteigend:
-Param-Defaults < Store < Env (`SCHUELERPORTAL_SECRET`, Format parst das Plugin)
-< explizite Parameter.
+Param-Defaults < Store < Env (`SCHUELERPORTAL_SECRET`, `MEBIS_SECRET`,
+`BYCS_DRIVE_SECRET` — Format parst das Plugin: `user:pass`,
+`host:user:pass` bzw. JSON) < explizite Parameter.
 
 ```bash
 # Interaktiv (fehlende Pflichtwerte werden abgefragt, Passwort ohne Echo):
@@ -127,6 +128,46 @@ Schulkürzel im API-Pfad. Nach `auth` genügen:
 /tmp/schoolconnect tool schuelerportal hausaufgaben
 /tmp/schoolconnect tool schuelerportal vertretungsplan --datum 2026-09-15
 ```
+
+### mebis: ByCS-Lernplattform (Moodle)
+
+Echter Zugriff auf `https://lernplattform.bycs.de` (Keycloak-SSO via
+`lernplattform-v2`, danach Moodle-AJAX mit `sesskey`). Nach `auth` genügen:
+
+```bash
+/tmp/schoolconnect tool mebis auth --username <kennung>   # Passwort wird abgefragt
+/tmp/schoolconnect tool mebis courses --query w-seminar
+/tmp/schoolconnect tool mebis abschnitte --course <id>          # Übersicht: Nr, Titel, Modultypen
+/tmp/schoolconnect tool mebis inhalt --course <id> --abschnitt "12/1" --typ Datei --query exposé
+/tmp/schoolconnect tool mebis fetch --modul 85090819 --ziel ~/Downloads/
+```
+
+`inhalt` filtert optional nach Abschnittstitel (`--abschnitt`), Modultyp
+(`--typ`, z.B. `Datei`/`resource`/`H5P`/`Forum`) und Modulname (`--query`).
+`fetch` lädt Datei-Module (`resource`, auch via `--url`); Verzeichnisse
+(`folder`) listen ihre Dateien — dann per `--datei <name>` eine wählen.
+
+### bycs-drive: ByCS Drive (Dateicloud)
+
+Echter Zugriff auf `https://<host>` (ownCloud OCIS, z.B.
+`0978.drive.bycs.de`; Login via Browser-Flow: `authorize` + PKCE →
+Identity-Broker → Keycloak-Form auf `auth.bycs.de`). `host` akzeptiert
+`0978`, `0978.drive.bycs.de` oder volle URLs (Default: `0978`). Nach `auth`
+genügen:
+
+```bash
+/tmp/schoolconnect tool bycs-drive auth --username <kennung>   # Passwort wird abgefragt
+/tmp/schoolconnect tool bycs-drive spaces                       # persönlich + Projekt-Spaces (mit Quota)
+/tmp/schoolconnect tool bycs-drive spaces --query 1k1
+/tmp/schoolconnect tool bycs-drive list --space 1k1_wi          # Wurzel: Ordner + Dateien (eine Ebene)
+/tmp/schoolconnect tool bycs-drive list --space 1k1_wi --pfad /2.Halbjahr --query pdf
+/tmp/schoolconnect tool bycs-drive fetch --space 1k1_wi --pfad /2.Halbjahr/Blatt.pdf --ziel ~/Downloads/
+```
+
+`list` nimmt Space-ID *oder* Namen-Teiltreffer (`--space 1k1_wi`), `--pfad`
+steigt beliebig tief ab, Ordner stehen vor Dateien. `fetch` speichert mit
+Originalnamen (`--ziel` als Datei oder Ordner; fehlende Ordner werden
+angelegt).
 
 ### lernplan-bayern: LehrplanPLUS-Suche
 
