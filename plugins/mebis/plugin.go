@@ -743,6 +743,9 @@ func resolveZiel(ziel, name string) (string, error) {
 		return filepath.Join(cwd, name), nil
 	}
 	if strings.HasSuffix(ziel, "/") {
+		if err := os.MkdirAll(ziel, 0o755); err != nil {
+			return "", coreerrors.Wrap(coreerrors.CodeInternal, "mebis", "zielordner anlegen fehlgeschlagen", err)
+		}
 		return filepath.Join(ziel, name), nil
 	}
 	if fi, err := os.Stat(ziel); err == nil && fi.IsDir() {

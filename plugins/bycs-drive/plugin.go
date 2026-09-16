@@ -1,16 +1,21 @@
 // Package bycsdrive kapselt ByCS Drive (ownCloud OCIS hinter Keycloak,
 // z.B. https://0978.drive.bycs.de).
 //
-// Login (aus HAR-Mitschnitt rekonstruiert, Token-Endpunkt live verifiziert):
+// Login (aus HAR-Mitschnitt rekonstruiert, Kette live per curl verifiziert):
 //  1. GET https://<host>/config.json → openIdConnect {authority, client_id}
 //     (z.B. authority https://auth.drive.bycs.de/realms/bycs,
 //     client_id school-0978-web).
-//  2. POST {authority}/protocol/openid-connect/token mit
-//     application/x-www-form-urlencoded
-//     {grant_type=password, client_id, username, password,
-//     scope="openid profile email"} → {access_token (5 Min),
-//     refresh_token, expires_in}.
-//  3. Alle Daten-Calls mit Header "Authorization: Bearer <access_token>":
+//  2. GET {authority}/protocol/openid-connect/auth
+//     (?client_id=…&redirect_uri=https://<host>/oidc-callback.html&
+//     response_type=code, PKCE via S256-Challenge) — der Client folgt den
+//     Redirects: Drive-Realm → Identity-Broker → zentrales auth.bycs.de,
+//     wo das Keycloak-Loginformular liegt.
+//  3. Dort POST auf die Form-Action mit
+//     application/x-www-form-urlencoded {username, password, credentialId:""}.
+//  4. Bei Erfolg Redirects bis zum oidc-callback der Instanz folgen (?code=…)
+//     und code + PKCE-Verifier am Token-Endpunkt einlösen → {access_token
+//     (~5 Min), refresh_token}.
+//  5. Alle Daten-Calls mit Header "Authorization: Bearer <access_token>":
 //     Spaces via Graph (GET /graph/v1beta1/me/drives?$filter=driveType eq …),
 //     Ordner via WebDAV (PROPFIND /dav/spaces/<space-id>/<pfad>, Depth: 1),
 //     Download via GET /dav/spaces/<space-id>/<pfad>.
@@ -27,11 +32,16 @@ package bycsdrive
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path"
@@ -69,12 +79,15 @@ var (
 	numRe  = regexp.MustCompile(`^[0-9]+$`)
 )
 
+// formRe findet die Keycloak-Loginform-Action (id="kc-form-login").
+var formRe = regexp.MustCompile(`(?s)<form[^>]*id="kc-form-login"[^>]*action="([^"]+)"`)
+
 // dispNameRe liest den Dateinamen aus Content-Disposition.
 var dispNameRe = regexp.MustCompile(`(?i)filename\*=UTF-8''([^;]+)|filename="([^"]+)"`)
 
 // Plugin implementiert domain.Plugin.
 type Plugin struct {
-	client *http.Client // eigener Client (Bearer-Auth, keine Cookies nötig)
+	client *http.Client // eigener Client für OIDC + API-Calls
 
 	mu       sync.Mutex
 	authed   bool
@@ -84,12 +97,15 @@ type Plugin struct {
 	access   string // OIDC-Access-Token (kurzlebig, ~5 Min)
 	refresh  string // OIDC-Refresh-Token
 	expiry   time.Time
+	authURL  string // Autorisierungs-Endpunkt der Instanz
 	tokenURL string // Token-Endpunkt der Instanz
 	clientID string // OIDC-Client der Instanz
 }
 
-// New erzeugt das Plugin. Der Core-Client liefert Timeout/Transport.
+// New erzeugt das Plugin. Der Core-Client liefert Timeout/Transport,
+// die Cookie-Verwaltung (Login-Kette) baut das Plugin selbst auf.
 func New(client *http.Client) *Plugin {
+	jar, _ := cookiejar.New(nil)
 	timeout := 15 * time.Second
 	var transport http.RoundTripper
 	if client != nil {
@@ -98,7 +114,7 @@ func New(client *http.Client) *Plugin {
 		}
 		transport = client.Transport
 	}
-	return &Plugin{client: &http.Client{Timeout: timeout, Transport: transport}}
+	return &Plugin{client: &http.Client{Timeout: timeout, Transport: transport, Jar: jar}}
 }
 
 func (p *Plugin) ID() string   { return "bycs-drive" }
@@ -668,7 +684,12 @@ func (p *Plugin) do(req *http.Request) ([]byte, *http.Response, error) {
 
 func setAuth(req *http.Request, tok string) {
 	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set("User-Agent", "SchoolConnect/1.0")
+}
+
+// setBrowserHeaders setzt die Header, die ein Browser laut HAR mitschickt.
+func setBrowserHeaders(h http.Header) {
+	h.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,text/plain,*/*;q=0.8")
+	h.Set("User-Agent", "SchoolConnect/1.0")
 }
 
 // --- Auth-Mechanik ---
@@ -829,24 +850,25 @@ func (p *Plugin) markStale() {
 	p.expiry = time.Time{}
 }
 
-// oidcConfig liest Authority + Client-ID aus /config.json der Instanz.
-func (p *Plugin) oidcConfig(ctx context.Context, host string) (tokenURL, clientID string, err error) {
+// oidcConfig liest Authority + Client-ID aus /config.json der Instanz und
+// liefert Autorisierungs- + Token-Endpunkt.
+func (p *Plugin) oidcConfig(ctx context.Context, host string) (authURL, tokenURL, clientID string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+"/config.json", nil)
 	if err != nil {
-		return "", "", coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
+		return "", "", "", coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "drive nicht erreichbar", err)
+		return "", "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "drive nicht erreichbar", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
 	if err != nil {
-		return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "antwort lesen fehlgeschlagen", err)
+		return "", "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "antwort lesen fehlgeschlagen", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(),
+		return "", "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(),
 			fmt.Sprintf("drive antwortet mit HTTP %d", resp.StatusCode))
 	}
 	var cfg struct {
@@ -856,23 +878,114 @@ func (p *Plugin) oidcConfig(ctx context.Context, host string) (tokenURL, clientI
 		} `json:"openIdConnect"`
 	}
 	if err := json.Unmarshal(raw, &cfg); err != nil || cfg.OpenID.Authority == "" || cfg.OpenID.ClientID == "" {
-		return "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(), "drive-konfiguration unverständlich (config.json)")
+		return "", "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(), "drive-konfiguration unverständlich (config.json)")
 	}
 	if !strings.HasPrefix(cfg.OpenID.Authority, "https://") {
-		return "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(), "drive-konfiguration ungültig (authority)")
+		return "", "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(), "drive-konfiguration ungültig (authority)")
 	}
-	return strings.TrimSuffix(cfg.OpenID.Authority, "/") + "/protocol/openid-connect/token",
+	base := strings.TrimSuffix(cfg.OpenID.Authority, "/")
+	return base + "/protocol/openid-connect/auth",
+		base + "/protocol/openid-connect/token",
 		cfg.OpenID.ClientID, nil
 }
 
-// login fährt den Password-Grant: config.json → Token-Endpunkt → Tokens.
+// login fährt den Browser-Flow wie das Web-UI (live per curl verifiziert):
+// config.json → authorize (PKCE) → Identity-Broker → zentrales
+// auth.bycs.de (Keycloak-Form mit username/password) → Broker-Callback →
+// oidc-callback (code) → Token-Endpunkt (code + PKCE-Verifier).
 func (p *Plugin) login(ctx context.Context, c creds) error {
 	host := normalizeHost(c.Host)
-	tokenURL, clientID, err := p.oidcConfig(ctx, host)
+	authURL, tokenURL, clientID, err := p.oidcConfig(ctx, host)
 	if err != nil {
 		return err
 	}
-	tok, err := p.passwordGrant(ctx, tokenURL, clientID, c.Username, c.Password)
+	jar, _ := cookiejar.New(nil)
+	p.client.Jar = jar
+
+	verifier, challenge, err := newPKCE()
+	if err != nil {
+		return coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "login vorbereiten fehlgeschlagen", err)
+	}
+	// 1. Autorisierungs-Request (folgt Broker-Redirects bis zur
+	//    Keycloak-Loginseite auf dem zentralen auth.bycs.de).
+	state := "schoolconnect-" + randomToken()
+	authReq, err := http.NewRequestWithContext(ctx, http.MethodGet, authURL, nil)
+	if err != nil {
+		return coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
+	}
+	aq := authReq.URL.Query()
+	aq.Set("client_id", clientID)
+	aq.Set("redirect_uri", "https://"+host+"/oidc-callback.html")
+	aq.Set("response_type", "code")
+	aq.Set("scope", "openid profile email")
+	aq.Set("state", state)
+	aq.Set("nonce", state)
+	aq.Set("code_challenge", challenge)
+	aq.Set("code_challenge_method", "S256")
+	authReq.URL.RawQuery = aq.Encode()
+	setBrowserHeaders(authReq.Header)
+	resp, err := p.client.Do(authReq)
+	if err != nil {
+		return coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "drive nicht erreichbar", err)
+	}
+	page, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return coreerrors.New(coreerrors.CodeUpstream, p.ID(),
+			fmt.Sprintf("login-start antwortet mit HTTP %d", resp.StatusCode))
+	}
+	m := formRe.FindStringSubmatch(string(page))
+	if m == nil {
+		return coreerrors.New(coreerrors.CodeUpstream, p.ID(),
+			"keycloak-loginseite nicht gefunden (SSO-Kette unerwartet — Seite hat sich geändert?)")
+	}
+	action := html.UnescapeString(m[1])
+
+	// 2. Credentials posten (keinen Redirects folgen — Location auswerten).
+	form := url.Values{}
+	form.Set("username", c.Username)
+	form.Set("password", c.Password)
+	form.Set("credentialId", "")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, action, strings.NewReader(form.Encode()))
+	if err != nil {
+		return coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
+	}
+	setBrowserHeaders(req.Header)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	noRedirect := *p.client
+	noRedirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err = noRedirect.Do(req)
+	if err != nil {
+		return coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "login-server nicht erreichbar", err)
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
+	resp.Body.Close()
+	loc := resp.Header.Get("Location")
+	if (resp.StatusCode == http.StatusUnauthorized) ||
+		(resp.StatusCode == http.StatusOK && strings.Contains(string(raw), `id="kc-form-login"`)) {
+		return coreerrors.New(coreerrors.CodeUnauthorized, p.ID(),
+			"login abgelehnt (username/passwort prüfen)")
+	}
+	if resp.StatusCode < 300 || resp.StatusCode > 399 || loc == "" {
+		return coreerrors.New(coreerrors.CodeUpstream, p.ID(),
+			fmt.Sprintf("login antwortet unerwartet mit HTTP %d (Formulardetails prüfen)", resp.StatusCode))
+	}
+
+	// 3. Broker-Kette bis zum oidc-callback folgen, Code einsammeln.
+	code, callbackState, err := p.followLogins(ctx, loc, host)
+	if err != nil {
+		return err
+	}
+	_ = callbackState
+
+	// 4. Code + PKCE-Verifier am Token-Endpunkt einlösen.
+	tokForm := url.Values{}
+	tokForm.Set("grant_type", "authorization_code")
+	tokForm.Set("client_id", clientID)
+	tokForm.Set("redirect_uri", "https://"+host+"/oidc-callback.html")
+	tokForm.Set("code", code)
+	tokForm.Set("code_verifier", verifier)
+	tok, err := p.tokenPost(ctx, tokenURL, tokForm)
 	if err != nil {
 		return err
 	}
@@ -885,16 +998,100 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 	p.access = tok.Access
 	p.refresh = tok.Refresh
 	p.expiry = time.Now().Add(time.Duration(tok.ExpiresIn-30) * time.Second)
+	p.authURL = authURL
 	p.tokenURL = tokenURL
 	p.clientID = clientID
 	return nil
+}
+
+// followLogins folgt der Login-Kette nach dem Form-POST (Broker-Callback
+// auf auth.drive.bycs.de → oidc-callback auf der Instanz) und liefert
+// Code + State aus dem oidc-callback.
+func (p *Plugin) followLogins(ctx context.Context, loc, host string) (code, state string, err error) {
+	current := loc
+	noRedirect := *p.client
+	noRedirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	for hops := 0; hops < 10; hops++ {
+		u, err := url.Parse(current)
+		if err != nil {
+			return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "redirect-url ungültig", err)
+		}
+		if !u.IsAbs() {
+			// Relative Redirects gegen den richtigen Host auflösen
+			// (Kette wandert zwischen auth.bycs.de, auth.drive.bycs.de
+			// und der Instanz).
+			base, _ := url.Parse("https://" + host + "/")
+			u = base.ResolveReference(u)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return "", "", coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
+		}
+		setBrowserHeaders(req.Header)
+		resp, err := noRedirect.Do(req)
+		if err != nil {
+			return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "login-server nicht erreichbar", err)
+		}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
+		resp.Body.Close()
+		next := resp.Header.Get("Location")
+		if resp.StatusCode >= 300 && resp.StatusCode <= 399 && next != "" {
+			nu, err := url.Parse(next)
+			if err != nil {
+				return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "redirect-url ungültig", err)
+			}
+			current = u.ResolveReference(nu).String()
+			// oidc-callback der Instanz erreicht: Code einsammeln.
+			if cu, err := url.Parse(current); err == nil &&
+				strings.EqualFold(cu.Host, host) && strings.HasPrefix(cu.Path, "/oidc-callback") {
+				q := cu.Query()
+				if q.Get("code") == "" {
+					return "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(),
+						"login-callback ohne code (Fehlerseite? "+truncate(string(raw), 200)+")")
+				}
+				return q.Get("code"), q.Get("state"), nil
+			}
+			continue
+		}
+		return "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(),
+			fmt.Sprintf("login-kette endet mit HTTP %d (erwartet: oidc-callback)", resp.StatusCode))
+	}
+	return "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(), "zu viele redirects in der login-kette")
+}
+
+// newPKCE erzeugt Verifier + S256-Challenge für den Code-Flow.
+func newPKCE() (verifier, challenge string, err error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", "", err
+	}
+	verifier = base64.RawURLEncoding.EncodeToString(raw)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge = base64.RawURLEncoding.EncodeToString(sum[:])
+	return verifier, challenge, nil
+}
+
+func randomToken() string {
+	raw := make([]byte, 12)
+	if _, err := rand.Read(raw); err != nil {
+		return "state"
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func truncate(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 // refreshAuth erneuert das Access-Token über den Refresh-Token.
 func (p *Plugin) refreshAuth(ctx context.Context, host, tokenURL, clientID, refresh string) error {
 	if tokenURL == "" || clientID == "" {
 		var err error
-		if tokenURL, clientID, err = p.oidcConfig(ctx, host); err != nil {
+		if _, tokenURL, clientID, err = p.oidcConfig(ctx, host); err != nil {
 			return err
 		}
 	}
@@ -926,17 +1123,6 @@ type tokenResp struct {
 	Access    string `json:"access_token"`
 	Refresh   string `json:"refresh_token"`
 	ExpiresIn int    `json:"expires_in"`
-}
-
-// passwordGrant holt Tokens per Resource-Owner-Password-Flow.
-func (p *Plugin) passwordGrant(ctx context.Context, tokenURL, clientID, username, password string) (*tokenResp, error) {
-	form := url.Values{}
-	form.Set("grant_type", "password")
-	form.Set("client_id", clientID)
-	form.Set("username", username)
-	form.Set("password", password)
-	form.Set("scope", "openid profile email")
-	return p.tokenPost(ctx, tokenURL, form)
 }
 
 func (p *Plugin) tokenPost(ctx context.Context, tokenURL string, form url.Values) (*tokenResp, error) {
@@ -1138,6 +1324,9 @@ func resolveZiel(ziel, name string) (string, error) {
 		return filepath.Join(cwd, name), nil
 	}
 	if strings.HasSuffix(ziel, "/") {
+		if err := os.MkdirAll(ziel, 0o755); err != nil {
+			return "", coreerrors.Wrap(coreerrors.CodeInternal, "bycs-drive", "zielordner anlegen fehlgeschlagen", err)
+		}
 		return filepath.Join(ziel, name), nil
 	}
 	if fi, err := os.Stat(ziel); err == nil && fi.IsDir() {
