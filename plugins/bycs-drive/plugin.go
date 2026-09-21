@@ -54,6 +54,7 @@ import (
 	"time"
 
 	coreerrors "schoolconnect/internal/core/errors"
+	"schoolconnect/internal/core/tenant"
 	"schoolconnect/internal/domain"
 )
 
@@ -85,12 +86,12 @@ var formRe = regexp.MustCompile(`(?s)<form[^>]*id="kc-form-login"[^>]*action="([
 // dispNameRe liest den Dateinamen aus Content-Disposition.
 var dispNameRe = regexp.MustCompile(`(?i)filename\*=UTF-8''([^;]+)|filename="([^"]+)"`)
 
-// Plugin implementiert domain.Plugin.
-type Plugin struct {
+// sessionState hält Token + OIDC-Kontext eines Tenants (eigener Cookie-Jar,
+// damit Tenants im selben Prozess keine Login-Ketten/Sessions teilen).
+type sessionState struct {
 	client *http.Client // eigener Client für OIDC + API-Calls
+	authed bool
 
-	mu       sync.Mutex
-	authed   bool
 	host     string // Drive-Instanz, für die das Token gilt
 	user     string // ByCS-Kennung, für die das Token gilt
 	secret   string // Passwort (nur in-memory, für Re-Login)
@@ -102,10 +103,21 @@ type Plugin struct {
 	clientID string // OIDC-Client der Instanz
 }
 
+// maxSessions begrenzt die Tenant-Sessions im Speicher.
+const maxSessions = 32
+
+// Plugin implementiert domain.Plugin.
+type Plugin struct {
+	baseTimeout   time.Duration
+	baseTransport http.RoundTripper
+
+	mu       sync.Mutex
+	sessions map[string]*sessionState // key: tenant
+}
+
 // New erzeugt das Plugin. Der Core-Client liefert Timeout/Transport,
-// die Cookie-Verwaltung (Login-Kette) baut das Plugin selbst auf.
+// die Cookie-Verwaltung (Login-Kette, pro Tenant) baut das Plugin selbst auf.
 func New(client *http.Client) *Plugin {
-	jar, _ := cookiejar.New(nil)
 	timeout := 15 * time.Second
 	var transport http.RoundTripper
 	if client != nil {
@@ -114,7 +126,36 @@ func New(client *http.Client) *Plugin {
 		}
 		transport = client.Transport
 	}
-	return &Plugin{client: &http.Client{Timeout: timeout, Transport: transport, Jar: jar}}
+	return &Plugin{
+		baseTimeout:   timeout,
+		baseTransport: transport,
+		sessions:      map[string]*sessionState{},
+	}
+}
+
+// sessionFor liefert die Session eines Tenants (mit eigenem Cookie-Jar).
+func (p *Plugin) sessionFor(ctx context.Context) *sessionState {
+	t := tenant.FromContext(ctx)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s, ok := p.sessions[t]
+	if !ok {
+		if len(p.sessions) >= maxSessions {
+			for k := range p.sessions {
+				delete(p.sessions, k)
+				break
+			}
+		}
+		jar, _ := cookiejar.New(nil)
+		s = &sessionState{client: &http.Client{Timeout: p.baseTimeout, Transport: p.baseTransport, Jar: jar}}
+		p.sessions[t] = s
+	}
+	return s
+}
+
+// httpClient liefert den Tenant-eigenen Client.
+func (p *Plugin) httpClient(ctx context.Context) *http.Client {
+	return p.sessionFor(ctx).client
 }
 
 func (p *Plugin) ID() string   { return "bycs-drive" }
@@ -627,7 +668,7 @@ func (p *Plugin) davDoRaw(ctx context.Context, c creds, req *http.Request) ([]by
 		return nil, nil, err
 	}
 	setAuth(req, tok)
-	body, resp, err := p.do(req)
+	body, resp, err := p.do(ctx, req)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -635,7 +676,7 @@ func (p *Plugin) davDoRaw(ctx context.Context, c creds, req *http.Request) ([]by
 		return body, resp, nil
 	}
 	// Token tot: einmal erneuern und wiederholen.
-	p.markStale()
+	p.markStale(ctx)
 	tok, err = p.bearer(ctx, c)
 	if err != nil {
 		return nil, nil, err
@@ -655,12 +696,13 @@ func (p *Plugin) davDoRaw(ctx context.Context, c creds, req *http.Request) ([]by
 		}
 	}
 	setAuth(req2, tok)
-	return p.do(req2)
+	return p.do(ctx, req2)
 }
 
-// do führt den Request aus und mappt Statuscodes auf Fehler.
-func (p *Plugin) do(req *http.Request) ([]byte, *http.Response, error) {
-	resp, err := p.client.Do(req)
+// do führt den Request mit dem Tenant-eigenen Client aus und mappt
+// Statuscodes auf Fehler.
+func (p *Plugin) do(ctx context.Context, req *http.Request) ([]byte, *http.Response, error) {
+	resp, err := p.httpClient(ctx).Do(req)
 	if err != nil {
 		return nil, nil, coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "drive nicht erreichbar", err)
 	}
@@ -806,48 +848,52 @@ func (p *Plugin) ensureAuth(ctx context.Context, c creds) error {
 	return err
 }
 
-// bearer liefert ein gültiges Access-Token (erneuert bei Bedarf).
+// bearer liefert ein gültiges Access-Token des Tenants (erneuert bei Bedarf).
 func (p *Plugin) bearer(ctx context.Context, c creds) (string, error) {
 	host := normalizeHost(c.Host)
+	s := p.sessionFor(ctx)
 	p.mu.Lock()
-	if p.authed && strings.EqualFold(p.user, c.Username) && p.host == host &&
-		p.access != "" && time.Now().Before(p.expiry) {
-		tok := p.access
+	if s.authed && strings.EqualFold(s.user, c.Username) && s.host == host &&
+		s.access != "" && time.Now().Before(s.expiry) {
+		tok := s.access
 		if c.Password != "" {
-			p.secret = c.Password // Passwortwechsel übernehmen
+			s.secret = c.Password // Passwortwechsel übernehmen
 		}
 		p.mu.Unlock()
 		return tok, nil
 	}
 	refresh, tokenURL, clientID := "", "", ""
-	if p.authed && strings.EqualFold(p.user, c.Username) && p.host == host && p.refresh != "" {
-		refresh, tokenURL, clientID = p.refresh, p.tokenURL, p.clientID
+	if s.authed && strings.EqualFold(s.user, c.Username) && s.host == host && s.refresh != "" {
+		refresh, tokenURL, clientID = s.refresh, s.tokenURL, s.clientID
 	}
 	p.mu.Unlock()
 
 	if refresh != "" {
 		if err := p.refreshAuth(ctx, host, tokenURL, clientID, refresh); err == nil {
+			s := p.sessionFor(ctx)
 			p.mu.Lock()
 			defer p.mu.Unlock()
-			return p.access, nil
+			return s.access, nil
 		}
 		// Refresh fehlgeschlagen → voller Login mit Passwort.
 	}
 	if err := p.login(ctx, c); err != nil {
 		return "", err
 	}
+	s = p.sessionFor(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.access, nil
+	return s.access, nil
 }
 
-// markStale verwirft das aktuelle Token (nach 401), behält aber Benutzer +
-// Refresh-Token für die Erneuerung.
-func (p *Plugin) markStale() {
+// markStale verwirft das aktuelle Token des Tenants (nach 401), behält aber
+// Benutzer + Refresh-Token für die Erneuerung.
+func (p *Plugin) markStale(ctx context.Context) {
+	s := p.sessionFor(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.access = ""
-	p.expiry = time.Time{}
+	s.access = ""
+	s.expiry = time.Time{}
 }
 
 // oidcConfig liest Authority + Client-ID aus /config.json der Instanz und
@@ -858,7 +904,7 @@ func (p *Plugin) oidcConfig(ctx context.Context, host string) (authURL, tokenURL
 		return "", "", "", coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := p.client.Do(req)
+	resp, err := p.httpClient(ctx).Do(req)
 	if err != nil {
 		return "", "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "drive nicht erreichbar", err)
 	}
@@ -899,8 +945,11 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 	if err != nil {
 		return err
 	}
+	// Frischer Jar für die Login-Kette dieses Tenants.
 	jar, _ := cookiejar.New(nil)
-	p.client.Jar = jar
+	p.mu.Lock()
+	client := &http.Client{Timeout: p.baseTimeout, Transport: p.baseTransport, Jar: jar}
+	p.mu.Unlock()
 
 	verifier, challenge, err := newPKCE()
 	if err != nil {
@@ -924,7 +973,7 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 	aq.Set("code_challenge_method", "S256")
 	authReq.URL.RawQuery = aq.Encode()
 	setBrowserHeaders(authReq.Header)
-	resp, err := p.client.Do(authReq)
+	resp, err := client.Do(authReq)
 	if err != nil {
 		return coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "drive nicht erreichbar", err)
 	}
@@ -952,7 +1001,7 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 	}
 	setBrowserHeaders(req.Header)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	noRedirect := *p.client
+	noRedirect := *client
 	noRedirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err = noRedirect.Do(req)
 	if err != nil {
@@ -989,18 +1038,20 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 	if err != nil {
 		return err
 	}
+	s := p.sessionFor(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.authed = true
-	p.host = host
-	p.user = c.Username
-	p.secret = c.Password
-	p.access = tok.Access
-	p.refresh = tok.Refresh
-	p.expiry = time.Now().Add(time.Duration(tok.ExpiresIn-30) * time.Second)
-	p.authURL = authURL
-	p.tokenURL = tokenURL
-	p.clientID = clientID
+	s.client = client
+	s.authed = true
+	s.host = host
+	s.user = c.Username
+	s.secret = c.Password
+	s.access = tok.Access
+	s.refresh = tok.Refresh
+	s.expiry = time.Now().Add(time.Duration(tok.ExpiresIn-30) * time.Second)
+	s.authURL = authURL
+	s.tokenURL = tokenURL
+	s.clientID = clientID
 	return nil
 }
 
@@ -1009,7 +1060,7 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 // Code + State aus dem oidc-callback.
 func (p *Plugin) followLogins(ctx context.Context, loc, host string) (code, state string, err error) {
 	current := loc
-	noRedirect := *p.client
+	noRedirect := *p.httpClient(ctx)
 	noRedirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	for hops := 0; hops < 10; hops++ {
 		u, err := url.Parse(current)
@@ -1103,18 +1154,19 @@ func (p *Plugin) refreshAuth(ctx context.Context, host, tokenURL, clientID, refr
 	if err != nil {
 		return err
 	}
+	s := p.sessionFor(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.access = tok.Access
+	s.access = tok.Access
 	if tok.Refresh != "" {
-		p.refresh = tok.Refresh
+		s.refresh = tok.Refresh
 	}
-	p.expiry = time.Now().Add(time.Duration(tok.ExpiresIn-30) * time.Second)
+	s.expiry = time.Now().Add(time.Duration(tok.ExpiresIn-30) * time.Second)
 	if tokenURL != "" {
-		p.tokenURL = tokenURL
+		s.tokenURL = tokenURL
 	}
 	if clientID != "" {
-		p.clientID = clientID
+		s.clientID = clientID
 	}
 	return nil
 }
@@ -1132,7 +1184,7 @@ func (p *Plugin) tokenPost(ctx context.Context, tokenURL string, form url.Values
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
-	resp, err := p.client.Do(req)
+	resp, err := p.httpClient(ctx).Do(req)
 	if err != nil {
 		return nil, coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "login-server nicht erreichbar", err)
 	}

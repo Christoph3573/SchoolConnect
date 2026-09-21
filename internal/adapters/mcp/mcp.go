@@ -19,6 +19,7 @@ import (
 	"os"
 
 	"schoolconnect/internal/app"
+	"schoolconnect/internal/core/tenant"
 	"schoolconnect/internal/domain"
 )
 
@@ -44,8 +45,12 @@ type toolDef struct {
 	InputSchema any    `json:"inputSchema"`
 }
 
-// ServeSTDIO läuft bis EOF.
+// ServeSTDIO läuft bis EOF. Der Prozess ist an einen Tenant gebunden
+// (Env SC_TENANT, Default "default"): Alle Tool-Calls teilen sich dessen
+// gespeicherte Logins + Sessions — normale MCP-Nutzung bleibt unverändert,
+// Tool-Schemas enthalten keinen Tenant-Parameter.
 func (s *Server) ServeSTDIO(ctx context.Context) {
+	ctx = tenant.WithTenant(ctx, tenant.FromEnvOrDefault())
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	out := json.NewEncoder(os.Stdout)

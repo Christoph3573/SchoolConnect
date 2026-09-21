@@ -12,10 +12,10 @@ MCP ─┘
 ```
 
 - `internal/domain`: Ports — `Plugin`, `Function`, `Param`, `Result`. Einheitliche Typen, keine Logik.
-- `internal/app`: `Runtime` — `Register()`, `Call(plugin, fn, args)`, `CallMCP(toolName, args)`. Einziger Dispatch-Punkt.
-- `internal/core`: geteilte Infra — `config`, `logging` (slog), `errors` (Codes), `session`, `httpclient`. Keine Plattformlogik.
+- `internal/app`: `Runtime` — `Register()`, `Call(plugin, fn, args)`, `CallMCP(toolName, args)`. Einziger Dispatch-Punkt, besitzt Credential-Merge + synthetische `auth`/`logout`.
+- `internal/core`: geteilte Infra — `config`, `logging` (slog), `errors` (Codes), `session` (file-backed Credential-Store je Tenant, 0600), `tenant` (Tenant-Normierung + Context), `httpclient`. Keine Plattformlogik.
 - `internal/adapters`: `cli`, `rest`, `mcp`. Generisch: rendern alle registrierten Funktionen, enthalten keine Plugin-Details.
-- `plugins/<id>`: kapselt vollständig Auth, Sessions, API-Zugriff, Datenmodelle, Business-Logik, Mapping auf `domain.Result`.
+- `plugins/<id>`: kapselt vollständig Auth, Sessions (pro Tenant getrennt), API-Zugriff, Datenmodelle, Business-Logik, Mapping auf `domain.Result`.
 
 **Kernregel: Plattformlogik → Plugin. Infra → Core. Adapter nie pro Plugin anfassen.**
 
@@ -26,6 +26,49 @@ Eine `domain.Function` wird automatisch zu allen drei Schnittstellen:
 | `<plugin>.<fn>` + `Params` | `tool <plugin> <fn> [--p v]` | `GET\|POST /api/<plugin>/<fn>` | Tool `<plugin>_<fn>` (`-`→`_`), `required` aus `Param.Required` |
 
 MCP-Namen immer exakt über `Runtime.CallMCP()` auflösen (String-Split ist wegen `-`/`_` mehrdeutig).
+
+## Multi-Tenant (mehrere Nutzer/Gruppen auf einem Server)
+
+Jeder Tenant hat **getrennte Credentials** (`credentials.json`: `{"<tenant>": {"<plugin>": {...}}}`) und **getrennte Login-Sessions** (eigener Cookie-Jar/Token pro Tenant im Plugin, max. 32 im Speicher). Der Tenant ist **kein Funktions-Parameter**, sondern reist im Context mit: Adapter → Runtime → Plugin. Datenfunktionen deklarieren weiter keine Credential-Params.
+
+Tenant-Namen: `a-z, 0-9, -, _`, max. 64 Zeichen (lower-case normalisiert). Default-Tenant ist `default` — normale Einzelnutzung läuft ohne jede Angabe wie bisher.
+
+Alt-Format ohne Tenant-Ebene wird einmalig unter `_legacy` migriert (beim ersten Schreibzugriff ins neue Format überführt).
+
+| Schnittstelle | Tenant-Quelle | Verhalten |
+|---|---|---|
+| CLI | `--tenant <name>` (überall in der Arg-Liste) oder `SC_TENANT`, sonst `default` | `auth/logout/tool` arbeiten je Tenant isoliert |
+| REST | Header `X-SC-Tenant`, optional signiert via `X-SC-Tenant-Sig` (HMAC-SHA256 über den Tenant, Hex; nur wenn `SC_TENANT_SHARED_SECRET` gesetzt) | Mit `SC_REQUIRE_TENANT=true` verlangen Login-Plugins einen gültigen Tenant (sonst `401 tenant_required`); öffentliche Plugins (`NeedsAuth==false`), `/healthz` und `/api`-Index bleiben immer frei — kein Plugin-Switch im Adapter |
+| MCP | Prozess-weit via `SC_TENANT` (sonst `default`) — ein Prozess = ein Tenant | Tool-Schemas unverändert, kein Tenant-Argument pro Tool |
+
+Sicherheit: Mit `SC_REQUIRE_TENANT=true` schaltet die Runtime in den **sicheren Modus** und ignoriert `EnvCredentials` (`SCHUELERPORTAL_SECRET`, `MEBIS_SECRET`, `BYCS_DRIVE_SECRET`) — sonst würde ein global gesetztes Secret über Tenant-Grenzen leaken. Merge-Reihenfolge sonst wie bisher: Param-Defaults < Store(Tenant) < Env < explizite Parameter.
+
+```bash
+# Single-User (wie bisher, Default-Tenant):
+/tmp/schoolconnect auth mebis --username <kennung>
+/tmp/schoolconnect tool mebis courses
+
+# CLI mit Tenant:
+/tmp/schoolconnect --tenant klasse-10b auth mebis --username <kennung>
+SC_TENANT=klasse-10b /tmp/schoolconnect tool mebis courses
+/tmp/schoolconnect logout mebis --tenant klasse-10b
+
+# REST multi-tenant (Tenant-Pflicht nur für Login-Plugins):
+SC_REQUIRE_TENANT=true /tmp/schoolconnect serve
+curl -H 'X-SC-Tenant: klasse-10b' localhost:8080/api/mebis/courses
+curl localhost:8080/healthz                                        # ohne Tenant ok
+curl 'localhost:8080/api/lernplan-bayern/search?schulart=Gymnasium&lehrplankapitel=kap4&fach=Deutsch&jahrgangsstufe=9'  # ohne Tenant ok (öffentlich)
+
+# REST mit HMAC-Signatur (optional, Secret auf dem Server):
+SC_REQUIRE_TENANT=true SC_TENANT_SHARED_SECRET=s3cret /tmp/schoolconnect serve
+SIG=$(python3 -c "import hmac,hashlib; print(hmac.new(b's3cret', b'klasse-10b', hashlib.sha256).hexdigest())")
+curl -H 'X-SC-Tenant: klasse-10b' -H "X-SC-Tenant-Sig: $SIG" localhost:8080/api/mebis/courses
+
+# MCP mit Tenant (ein Prozess = ein Tenant):
+SC_TENANT=klasse-10b /tmp/schoolconnect mcp
+```
+
+Env-Übersicht: `REST_ADDR` (Default `:8080`), `SCHOOLCONNECT_CONFIG_DIR` (Default `~/.config/schoolconnect`), `LOG_LEVEL`, `SC_TENANT` (CLI/MCP), `SC_REQUIRE_TENANT=true` (REST-Pflicht, Default `false`), `SC_TENANT_SHARED_SECRET` (HMAC, optional).
 
 ## Schnellstart
 
@@ -83,13 +126,16 @@ MCP-Beispiel (`tools/call`):
 
 Plugins mit Login deklarieren `AuthParams()` (z.B. `schule`/`username`/`password`);
 die Runtime generiert daraus automatisch `<plugin>.auth` + `<plugin>.logout` —
-identisch in CLI, REST und MCP. Erfolgreiche Logins landen in
+identisch in CLI, REST und MCP. Erfolgreiche Logins landen pro Tenant in
 `~/.config/schoolconnect/credentials.json` (0600, via `SCHOOLCONNECT_CONFIG_DIR`
-umleitbar) und werden bei jedem Call automatisch injiziert. Datenfunktionen
+umleitbar; Format `{"<tenant>": {"<plugin>": {...}}}`, Alt-Bestände unter
+`_legacy`) und werden bei jedem Call automatisch injiziert. Datenfunktionen
 brauchen daher keine Credential-Params. Quelle der Credentials, aufsteigend:
-Param-Defaults < Store < Env (`SCHUELERPORTAL_SECRET`, `MEBIS_SECRET`,
+Param-Defaults < Store(Tenant) < Env (`SCHUELERPORTAL_SECRET`, `MEBIS_SECRET`,
 `BYCS_DRIVE_SECRET` — Format parst das Plugin: `user:pass`,
-`host:user:pass` bzw. JSON) < explizite Parameter.
+`host:user:pass` bzw. JSON; entfällt im sicheren Multi-Tenant-Modus,
+siehe oben) < explizite Parameter. `auth`-Antworten enthalten pro Tenant
+`tenant` plus nur Key-Namen, nie Secret-Werte.
 
 ```bash
 # Interaktiv (fehlende Pflichtwerte werden abgefragt, Passwort ohne Echo):

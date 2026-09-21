@@ -46,6 +46,7 @@ import (
 	"time"
 
 	coreerrors "schoolconnect/internal/core/errors"
+	"schoolconnect/internal/core/tenant"
 	"schoolconnect/internal/domain"
 )
 
@@ -89,21 +90,31 @@ var journalAttrRe = regexp.MustCompile(`([a-zA-Z_:][-a-zA-Z0-9_:.\[\]]*)\s*=\s*"
 var numRe = regexp.MustCompile(`^[0-9]+$`)
 var typRe = regexp.MustCompile(`^[a-z0-9_]+$`)
 
-// Plugin implementiert domain.Plugin.
-type Plugin struct {
-	client *http.Client // eigener Client mit Cookie-Jar für die Moodle-Session
-
-	mu      sync.Mutex
+// sessionState hält die Login-Session eines Tenants (eigener Cookie-Jar,
+// damit Tenants im selben Prozess keine Sessions teilen).
+type sessionState struct {
+	client  *http.Client // eigener Client mit Cookie-Jar für die Moodle-Session
 	authed  bool
 	user    string // ByCS-Kennung, für die die Session gilt
 	secret  string // Passwort der Session (nur in-memory, für Re-Login bei 403)
 	sesskey string // Moodle-AJAX-Schlüssel der Session
 }
 
+// maxSessions begrenzt die Tenant-Sessions im Speicher.
+const maxSessions = 32
+
+// Plugin implementiert domain.Plugin.
+type Plugin struct {
+	baseTimeout   time.Duration
+	baseTransport http.RoundTripper
+
+	mu       sync.Mutex
+	sessions map[string]*sessionState // key: tenant
+}
+
 // New erzeugt das Plugin. Der Core-Client liefert Timeout/Transport,
-// die Cookie-Verwaltung (Session) baut das Plugin selbst auf.
+// die Cookie-Verwaltung (Session, pro Tenant) baut das Plugin selbst auf.
 func New(client *http.Client) *Plugin {
-	jar, _ := cookiejar.New(nil)
 	timeout := 15 * time.Second
 	var transport http.RoundTripper
 	if client != nil {
@@ -113,8 +124,30 @@ func New(client *http.Client) *Plugin {
 		transport = client.Transport
 	}
 	return &Plugin{
-		client: &http.Client{Timeout: timeout, Transport: transport, Jar: jar},
+		baseTimeout:   timeout,
+		baseTransport: transport,
+		sessions:      map[string]*sessionState{},
 	}
+}
+
+// sessionFor liefert die Session eines Tenants (mit eigenem Cookie-Jar).
+func (p *Plugin) sessionFor(ctx context.Context) *sessionState {
+	t := tenant.FromContext(ctx)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s, ok := p.sessions[t]
+	if !ok {
+		if len(p.sessions) >= maxSessions {
+			for k := range p.sessions {
+				delete(p.sessions, k)
+				break
+			}
+		}
+		jar, _ := cookiejar.New(nil)
+		s = &sessionState{client: &http.Client{Timeout: p.baseTimeout, Transport: p.baseTransport, Jar: jar}}
+		p.sessions[t] = s
+	}
+	return s
 }
 
 func (p *Plugin) ID() string   { return "mebis" }
@@ -581,7 +614,7 @@ func (p *Plugin) eintrag(ctx context.Context, args map[string]string) (any, erro
 	}
 	setBrowserHeaders(req.Header)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := p.client.Do(req)
+	resp, err := p.httpClient(ctx).Do(req)
 	if err != nil {
 		return nil, coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "lernplattform nicht erreichbar", err)
 	}
@@ -728,7 +761,7 @@ func (p *Plugin) h5pAbschliessen(ctx context.Context, args map[string]string) (a
 	setBrowserHeaders(req.Header)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	resp, err := p.client.Do(req)
+	resp, err := p.httpClient(ctx).Do(req)
 	if err != nil {
 		return nil, coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "lernplattform nicht erreichbar", err)
 	}
@@ -964,7 +997,7 @@ func (p *Plugin) getBinary(ctx context.Context, rawURL string) (finalURL, ctype,
 		return "", "", "", nil, coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
 	}
 	setBrowserHeaders(req.Header)
-	resp, err := p.client.Do(req)
+	resp, err := p.httpClient(ctx).Do(req)
 	if err != nil {
 		return "", "", "", nil, coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "lernplattform nicht erreichbar", err)
 	}
@@ -1157,12 +1190,19 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// ensureAuth meldet an, falls keine Session für diesen Benutzer besteht.
+// httpClient liefert den Tenant-eigenen Client mit Cookie-Jar.
+func (p *Plugin) httpClient(ctx context.Context) *http.Client {
+	return p.sessionFor(ctx).client
+}
+
+// ensureAuth meldet an, falls keine Session dieses Tenants für diesen
+// Benutzer besteht.
 func (p *Plugin) ensureAuth(ctx context.Context, c creds) error {
+	s := p.sessionFor(ctx)
 	p.mu.Lock()
-	ok := p.authed && strings.EqualFold(p.user, c.Username)
+	ok := s.authed && strings.EqualFold(s.user, c.Username)
 	if ok {
-		p.secret = c.Password // Passwortwechsel übernehmen, Session bleibt gültig
+		s.secret = c.Password // Passwortwechsel übernehmen, Session bleibt gültig
 	}
 	p.mu.Unlock()
 	if ok {
@@ -1173,18 +1213,20 @@ func (p *Plugin) ensureAuth(ctx context.Context, c creds) error {
 
 // login fährt den HAR-rekonstruierten Flow:
 // GET / (folgt SSO-Redirects bis zur Keycloak-Form) → Form-Action parsen →
+// GET / (folgt SSO-Redirects bis zur Keycloak-Form) → Form-Action parsen →
 // POST {username, password, credentialId:""} → Redirects bis Moodle folgen →
 // sesskey aus Seiten-HTML lesen.
 func (p *Plugin) login(ctx context.Context, c creds) error {
+	s := p.sessionFor(ctx)
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
-	// Frischer Jar pro Login (alte Sessions verwerfen).
+	// Frischer Jar pro Login (alte Sessions dieses Tenants verwerfen).
 	jar, _ := cookiejar.New(nil)
-	p.client.Jar = jar
+	client := &http.Client{Timeout: p.baseTimeout, Transport: p.baseTransport, Jar: jar}
+	p.mu.Unlock()
 
 	// 1. SSO-Kette bis zur Keycloak-Loginseite (Client folgt Redirects).
-	_, page, err := p.getPage(ctx, moodleBase+"/")
+	_, page, err := getPage(client, ctx, moodleBase+"/", p.ID())
 	if err != nil {
 		return err
 	}
@@ -1206,7 +1248,7 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 	}
 	setBrowserHeaders(req.Header)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	noRedirect := *p.client
+	noRedirect := *client
 	noRedirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := noRedirect.Do(req)
 	if err != nil {
@@ -1226,7 +1268,7 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 	}
 
 	// 3. Callback-Redirects bis Moodle folgen, sesskey auslesen.
-	finalURL, page, err := p.followRedirects(ctx, loc)
+	finalURL, page, err := followRedirects(client, ctx, loc, p.ID())
 	if err != nil {
 		return err
 	}
@@ -1237,31 +1279,39 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 			"session-check nach login fehlgeschlagen (kein sesskey — ggf. Zugangsdaten falsch)")
 	}
 
-	p.authed = true
-	p.user = c.Username
-	p.secret = c.Password
-	p.sesskey = sm[1]
+	p.mu.Lock()
+	s.client = client
+	s.authed = true
+	s.user = c.Username
+	s.secret = c.Password
+	s.sesskey = sm[1]
+	p.mu.Unlock()
 	return nil
 }
 
 // getPage lädt eine Seite (folgt Redirects) und liefert finale URL + Body.
 func (p *Plugin) getPage(ctx context.Context, rawURL string) (string, string, error) {
+	return getPage(p.httpClient(ctx), ctx, rawURL, p.ID())
+}
+
+// getPage lädt eine Seite mit explizitem Client (folgt Redirects).
+func getPage(client *http.Client, ctx context.Context, rawURL, pluginID string) (string, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return "", "", coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
+		return "", "", coreerrors.Wrap(coreerrors.CodeInternal, pluginID, "request bauen fehlgeschlagen", err)
 	}
 	setBrowserHeaders(req.Header)
-	resp, err := p.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "lernplattform nicht erreichbar", err)
+		return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, pluginID, "lernplattform nicht erreichbar", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
 	if err != nil {
-		return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "antwort lesen fehlgeschlagen", err)
+		return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, pluginID, "antwort lesen fehlgeschlagen", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(),
+		return "", "", coreerrors.New(coreerrors.CodeUpstream, pluginID,
 			fmt.Sprintf("lernplattform antwortet mit HTTP %d", resp.StatusCode))
 	}
 	final := ""
@@ -1274,11 +1324,15 @@ func (p *Plugin) getPage(ctx context.Context, rawURL string) (string, string, er
 // followRedirects folgt Location-Redirects manuell (für die Login-Kette),
 // damit Cookies pro Hop im Jar landen, und liefert finale URL + Body.
 func (p *Plugin) followRedirects(ctx context.Context, loc string) (string, string, error) {
+	return followRedirects(p.httpClient(ctx), ctx, loc, p.ID())
+}
+
+func followRedirects(client *http.Client, ctx context.Context, loc, pluginID string) (string, string, error) {
 	current := loc
 	for hops := 0; hops < 10; hops++ {
 		u, err := url.Parse(current)
 		if err != nil {
-			return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "redirect-url ungültig", err)
+			return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, pluginID, "redirect-url ungültig", err)
 		}
 		if !u.IsAbs() {
 			base, _ := url.Parse(moodleBase + "/")
@@ -1286,43 +1340,44 @@ func (p *Plugin) followRedirects(ctx context.Context, loc string) (string, strin
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if err != nil {
-			return "", "", coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
+			return "", "", coreerrors.Wrap(coreerrors.CodeInternal, pluginID, "request bauen fehlgeschlagen", err)
 		}
 		setBrowserHeaders(req.Header)
-		noRedirect := *p.client
+		noRedirect := *client
 		noRedirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 		resp, err := noRedirect.Do(req)
 		if err != nil {
-			return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "lernplattform nicht erreichbar", err)
+			return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, pluginID, "lernplattform nicht erreichbar", err)
 		}
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyRead))
 		resp.Body.Close()
 		next := resp.Header.Get("Location")
 		if resp.StatusCode < 300 || resp.StatusCode > 399 || next == "" {
 			if resp.StatusCode != http.StatusOK {
-				return "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(),
+				return "", "", coreerrors.New(coreerrors.CodeUpstream, pluginID,
 					fmt.Sprintf("login-kette endet mit HTTP %d", resp.StatusCode))
 			}
 			return u.String(), string(raw), nil
 		}
 		nu, err := url.Parse(next)
 		if err != nil {
-			return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "redirect-url ungültig", err)
+			return "", "", coreerrors.Wrap(coreerrors.CodeUpstream, pluginID, "redirect-url ungültig", err)
 		}
 		current = u.ResolveReference(nu).String()
 	}
-	return "", "", coreerrors.New(coreerrors.CodeUpstream, p.ID(), "zu viele redirects in der login-kette")
+	return "", "", coreerrors.New(coreerrors.CodeUpstream, pluginID, "zu viele redirects in der login-kette")
 }
 
 // ajax ruft eine Moodle-Webservice-Funktion auf. Bei abgelaufener Session
 // (sesskey-Fehler / Loginseite statt JSON) wird mit den gespeicherten
-// Session-Credentials einmal neu angemeldet und wiederholt.
+// Session-Credentials des Tenants einmal neu angemeldet und wiederholt.
 func (p *Plugin) ajax(ctx context.Context, method string, args map[string]any, out any) error {
 	if err := p.doAjax(ctx, method, args, out); err != nil {
 		if ce, ok := err.(*coreerrors.Error); ok && ce.Code == coreerrors.CodeUnauthorized {
+			s := p.sessionFor(ctx)
 			p.mu.Lock()
-			p.authed = false
-			c := creds{Username: p.user, Password: p.secret}
+			s.authed = false
+			c := creds{Username: s.user, Password: s.secret}
 			p.mu.Unlock()
 			if c.validate() == nil {
 				if lerr := p.login(ctx, c); lerr == nil {
@@ -1336,8 +1391,10 @@ func (p *Plugin) ajax(ctx context.Context, method string, args map[string]any, o
 }
 
 func (p *Plugin) doAjax(ctx context.Context, method string, args map[string]any, out any) error {
+	s := p.sessionFor(ctx)
 	p.mu.Lock()
-	sesskey := p.sesskey
+	sesskey := s.sesskey
+	client := s.client
 	p.mu.Unlock()
 	if sesskey == "" {
 		return coreerrors.New(coreerrors.CodeUnauthorized, p.ID(), "keine session (erneut anmelden)")
@@ -1351,7 +1408,7 @@ func (p *Plugin) doAjax(ctx context.Context, method string, args map[string]any,
 	}
 	setBrowserHeaders(req.Header)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := p.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "lernplattform nicht erreichbar", err)
 	}

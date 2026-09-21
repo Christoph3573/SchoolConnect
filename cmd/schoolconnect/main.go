@@ -44,9 +44,12 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "serve":
-			srv := rest.New(rt, log)
+			if cfg.RequireTenant {
+				rt.SetMultiTenant(true)
+			}
+			srv := rest.NewWithTenantPolicy(rt, log, cfg.RequireTenant, cfg.TenantSharedSecret)
 			addr := cfg.RestAddr
-			log.Info("REST listening", "addr", addr)
+			log.Info("REST listening", "addr", addr, "require_tenant", cfg.RequireTenant)
 			fmt.Printf("REST: http://localhost%s/api  (z.B. /api/lernplan-bayern/search?query=Funktionen)\n", addr)
 			if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 				fmt.Fprintln(os.Stderr, "serve error:", err)

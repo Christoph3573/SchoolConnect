@@ -35,6 +35,7 @@ import (
 	"time"
 
 	coreerrors "schoolconnect/internal/core/errors"
+	"schoolconnect/internal/core/tenant"
 	"schoolconnect/internal/domain"
 )
 
@@ -46,21 +47,32 @@ const (
 
 var schuleRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
-// Plugin implementiert domain.Plugin.
-type Plugin struct {
-	client *http.Client // eigener Client mit Cookie-Jar für die Portal-Session
-
-	mu     sync.Mutex
+// sessionState hält die Login-Session eines Tenants (eigener Cookie-Jar,
+// damit Tenants im selben Prozess keine Sessions teilen).
+type sessionState struct {
+	client *http.Client
 	authed bool
 	schule string // Schulkürzel, für das die Session gilt
 	email  string // Username/E-Mail, für den die Session gilt
 	secret string // Passwort der Session (nur in-memory, für Re-Login bei 401/419)
 }
 
+// Plugin implementiert domain.Plugin.
+type Plugin struct {
+	baseTimeout   time.Duration
+	baseTransport http.RoundTripper
+
+	mu       sync.Mutex
+	sessions map[string]*sessionState // key: tenant
+}
+
+// maxSessions begrenzt die Tenant-Sessions im Speicher (LRU-ähnlich:
+// bei Überlauf wird eine beliebige älteste Session verworfen).
+const maxSessions = 32
+
 // New erzeugt das Plugin. Der Core-Client liefert Timeout/Transport,
-// die Cookie-Verwaltung (Session) baut das Plugin selbst auf.
+// die Cookie-Verwaltung (Session, pro Tenant) baut das Plugin selbst auf.
 func New(client *http.Client) *Plugin {
-	jar, _ := cookiejar.New(nil)
 	timeout := 15 * time.Second
 	var transport http.RoundTripper
 	if client != nil {
@@ -70,8 +82,30 @@ func New(client *http.Client) *Plugin {
 		transport = client.Transport
 	}
 	return &Plugin{
-		client: &http.Client{Timeout: timeout, Transport: transport, Jar: jar},
+		baseTimeout:   timeout,
+		baseTransport: transport,
+		sessions:      map[string]*sessionState{},
 	}
+}
+
+// sessionFor liefert die Session eines Tenants (mit eigenem Cookie-Jar).
+func (p *Plugin) sessionFor(ctx context.Context) *sessionState {
+	t := tenant.FromContext(ctx)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s, ok := p.sessions[t]
+	if !ok {
+		if len(p.sessions) >= maxSessions {
+			for k := range p.sessions {
+				delete(p.sessions, k)
+				break
+			}
+		}
+		jar, _ := cookiejar.New(nil)
+		s = &sessionState{client: &http.Client{Timeout: p.baseTimeout, Transport: p.baseTransport, Jar: jar}}
+		p.sessions[t] = s
+	}
+	return s
 }
 
 func (p *Plugin) ID() string   { return "schuelerportal" }
@@ -369,12 +403,14 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// ensureAuth meldet an, falls keine Session für dieses Schulkürzel + Benutzer besteht.
+// ensureAuth meldet an, falls keine Session dieses Tenants für dieses
+// Schulkürzel + Benutzer besteht.
 func (p *Plugin) ensureAuth(ctx context.Context, c creds) error {
+	s := p.sessionFor(ctx)
 	p.mu.Lock()
-	ok := p.authed && p.schule == c.Schule && strings.EqualFold(p.email, c.Username)
+	ok := s.authed && s.schule == c.Schule && strings.EqualFold(s.email, c.Username)
 	if ok {
-		p.secret = c.Password // Passwortwechsel übernehmen, Session bleibt gültig
+		s.secret = c.Password // Passwortwechsel übernehmen, Session bleibt gültig
 	}
 	p.mu.Unlock()
 	if ok {
@@ -386,7 +422,9 @@ func (p *Plugin) ensureAuth(ctx context.Context, c creds) error {
 // login fährt den HAR-rekonstruierten Flow pro Schulkürzel:
 // GET /<schule>/api/school (Session-Cookies) → POST /<schule>/login
 // (XSRF-Header) → GET /<schule>/api/user (Check).
+// Die Session (Jar + State) ist strikt tenant-eigen.
 func (p *Plugin) login(ctx context.Context, c creds) error {
+	s := p.sessionFor(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -398,7 +436,7 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 		return coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
 	}
 	setBrowserHeaders(req.Header, "")
-	resp, err := p.client.Do(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "schuelerportal nicht erreichbar", err)
 	}
@@ -415,9 +453,9 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 	if err != nil {
 		return coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
 	}
-	setBrowserHeaders(req.Header, p.xsrfToken())
+	setBrowserHeaders(req.Header, xsrfToken(s.client))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err = p.client.Do(req)
+	resp, err = s.client.Do(req)
 	if err != nil {
 		return coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "schuelerportal nicht erreichbar", err)
 	}
@@ -447,8 +485,8 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 	if err != nil {
 		return coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
 	}
-	setBrowserHeaders(req.Header, p.xsrfToken())
-	resp, err = p.client.Do(req)
+	setBrowserHeaders(req.Header, xsrfToken(s.client))
+	resp, err = s.client.Do(req)
 	if err != nil {
 		return coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "schuelerportal nicht erreichbar", err)
 	}
@@ -458,22 +496,23 @@ func (p *Plugin) login(ctx context.Context, c creds) error {
 		return coreerrors.New(coreerrors.CodeUnauthorized, p.ID(), "session-check nach login fehlgeschlagen")
 	}
 
-	p.authed = true
-	p.schule = c.Schule
-	p.email = c.Username
-	p.secret = c.Password
+	s.authed = true
+	s.schule = c.Schule
+	s.email = c.Username
+	s.secret = c.Password
 	return nil
 }
 
 // getAPI lädt einen JSON-Endpunkt; bei 401/419 (abgelaufene Laravel-Session)
-// wird mit den gespeicherten Session-Credentials einmal neu angemeldet
-// und wiederholt.
+// wird mit den gespeicherten Session-Credentials dieses Tenants einmal neu
+// angemeldet und wiederholt.
 func (p *Plugin) getAPI(ctx context.Context, schule, path string, out any) error {
 	if err := p.doAPI(ctx, schule, path, out); err != nil {
 		if ce, ok := err.(*coreerrors.Error); ok && ce.Code == coreerrors.CodeUnauthorized {
+			s := p.sessionFor(ctx)
 			p.mu.Lock()
-			p.authed = false
-			c := creds{Schule: p.schule, Username: p.email, Password: p.secret}
+			s.authed = false
+			c := creds{Schule: s.schule, Username: s.email, Password: s.secret}
 			p.mu.Unlock()
 			if c.validate() == nil {
 				if lerr := p.login(ctx, c); lerr == nil {
@@ -487,12 +526,13 @@ func (p *Plugin) getAPI(ctx context.Context, schule, path string, out any) error
 }
 
 func (p *Plugin) doAPI(ctx context.Context, schule, path string, out any) error {
+	s := p.sessionFor(ctx)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiBase+"/"+schule+path, nil)
 	if err != nil {
 		return coreerrors.Wrap(coreerrors.CodeInternal, p.ID(), "request bauen fehlgeschlagen", err)
 	}
-	setBrowserHeaders(req.Header, p.xsrfToken())
-	resp, err := p.client.Do(req)
+	setBrowserHeaders(req.Header, xsrfToken(s.client))
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return coreerrors.Wrap(coreerrors.CodeUpstream, p.ID(), "schuelerportal nicht erreichbar", err)
 	}
@@ -517,9 +557,9 @@ func (p *Plugin) doAPI(ctx context.Context, schule, path string, out any) error 
 
 // xsrfToken liest den aktuellen XSRF-TOKEN-Cookie-Wert (URL-decodiert,
 // wie ihn der Browser als X-XSRF-TOKEN-Header mitschickt).
-func (p *Plugin) xsrfToken() string {
+func xsrfToken(client *http.Client) string {
 	u, _ := url.Parse(apiBase + "/")
-	for _, c := range p.client.Jar.Cookies(u) {
+	for _, c := range client.Jar.Cookies(u) {
 		if c.Name != "XSRF-TOKEN" {
 			continue
 		}

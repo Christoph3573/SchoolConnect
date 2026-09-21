@@ -25,11 +25,16 @@ import (
 	"strings"
 
 	"schoolconnect/internal/app"
+	"schoolconnect/internal/core/tenant"
 	"schoolconnect/internal/domain"
 )
 
 // Run parst os.Args gegen die Runtime-Funktionen.
+// Der Tenant kommt aus --tenant <name> oder SC_TENANT (Default "default")
+// und gilt für auth/logout/tool gleichermaßen — normale Einzelnutzung
+// läuft ohne jede Angabe wie bisher.
 func Run(ctx context.Context, rt *app.Runtime, args []string) int {
+	ctx = withTenantFromArgs(ctx, args)
 	if len(args) < 2 || args[1] == "help" || args[1] == "-h" {
 		printHelp(rt)
 		return 0
@@ -49,9 +54,9 @@ func Run(ctx context.Context, rt *app.Runtime, args []string) int {
 	case "tool":
 		return runTool(ctx, rt, args)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: schoolconnect auth <plugin> [--param value ...]")
-		fmt.Fprintln(os.Stderr, "       schoolconnect tool <plugin> <function> [--param value ...]")
-		fmt.Fprintln(os.Stderr, "       schoolconnect logout <plugin>")
+		fmt.Fprintln(os.Stderr, "usage: schoolconnect auth <plugin> [--param value ...] [--tenant <name>]")
+		fmt.Fprintln(os.Stderr, "       schoolconnect tool <plugin> <function> [--param value ...] [--tenant <name>]")
+		fmt.Fprintln(os.Stderr, "       schoolconnect logout <plugin> [--tenant <name>]")
 		return 2
 	}
 }
@@ -61,7 +66,7 @@ func Run(ctx context.Context, rt *app.Runtime, args []string) int {
 // nach dem Env-Fallback der Runtime: Wer SCHUELERPORTAL_SECRET gesetzt hat,
 // wird ohne TTY und ohne einen einzigen Prompt angemeldet.
 func runAuth(ctx context.Context, rt *app.Runtime, args []string) int {
-	if len(args) < 3 {
+	if len(args) < 3 || strings.HasPrefix(args[2], "--") {
 		fmt.Fprintln(os.Stderr, "usage: schoolconnect auth <plugin> [--param value ...]")
 		return 2
 	}
@@ -91,7 +96,7 @@ func runAuth(ctx context.Context, rt *app.Runtime, args []string) int {
 
 // runLogout: schoolconnect logout <plugin>.
 func runLogout(ctx context.Context, rt *app.Runtime, args []string) int {
-	if len(args) < 3 {
+	if len(args) < 3 || strings.HasPrefix(args[2], "--") {
 		fmt.Fprintln(os.Stderr, "usage: schoolconnect logout <plugin>")
 		return 2
 	}
@@ -106,11 +111,15 @@ func runLogout(ctx context.Context, rt *app.Runtime, args []string) int {
 
 // runTool: schoolconnect tool <plugin> <function> [--param value ...].
 func runTool(ctx context.Context, rt *app.Runtime, args []string) int {
-	if len(args) < 4 {
+	if len(args) < 4 || strings.HasPrefix(args[2], "--") {
 		fmt.Fprintln(os.Stderr, "usage: schoolconnect tool <plugin> <function> [--param value ...]")
 		return 2
 	}
 	pluginID, funcName := args[2], args[3]
+	if strings.HasPrefix(funcName, "--") {
+		fmt.Fprintln(os.Stderr, "usage: schoolconnect tool <plugin> <function> [--param value ...]")
+		return 2
+	}
 	parsed := parseFlags(args[4:])
 
 	// Fehlende Pflicht-Params interaktiv nachfragen (nur mit TTY, sonst
@@ -154,7 +163,26 @@ func findFunction(rt *app.Runtime, pluginID, funcName string) *domain.Function {
 	return nil
 }
 
+// withTenantFromArgs legt den Tenant in den Context: --tenant <name>
+// (überall in der Arg-Liste, z.B. vor oder nach dem Subcommand) gewinnt
+// gegen SC_TENANT; ohne Angabe gilt der Default-Tenant.
+func withTenantFromArgs(ctx context.Context, args []string) context.Context {
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--tenant" && i+1 < len(args) {
+			return tenant.WithTenant(ctx, args[i+1])
+		}
+		if strings.HasPrefix(args[i], "--tenant=") {
+			return tenant.WithTenant(ctx, strings.TrimPrefix(args[i], "--tenant="))
+		}
+	}
+	if t := tenant.FromEnv(); t != "" {
+		return tenant.WithTenant(ctx, t)
+	}
+	return tenant.WithTenant(ctx, tenant.Default)
+}
+
 // parseFlags parst --key value / --key=value (Rest ohne -- ist ein Fehler).
+// --tenant wird hier herausgefiltert (gehört dem Adapter, nicht der Funktion).
 func parseFlags(rest []string) map[string]string {
 	parsed := map[string]string{}
 	for i := 0; i < len(rest); i++ {
@@ -164,6 +192,15 @@ func parseFlags(rest []string) map[string]string {
 			continue
 		}
 		tok = strings.TrimPrefix(tok, "--")
+		if tok == "tenant" {
+			if i+1 < len(rest) && !strings.HasPrefix(rest[i+1], "--") {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(tok, "tenant=") {
+			continue
+		}
 		if eq := strings.Index(tok, "="); eq >= 0 {
 			parsed[tok[:eq]] = tok[eq+1:]
 			continue
@@ -329,6 +366,9 @@ func printHelp(rt *app.Runtime) {
 	fmt.Println("  schoolconnect auth <plugin> [--p v ...]         anmelden (Fehlendes wird abgefragt)")
 	fmt.Println("  schoolconnect logout <plugin>                   Anmeldedaten verwerfen")
 	fmt.Println("  schoolconnect tool <plugin> <func> [--p v ...]  Funktion aufrufen")
+	fmt.Println()
+	fmt.Println("Tenant (optional, Default \"default\"):")
+	fmt.Println("  --tenant <name>  oder Env SC_TENANT   trennt gespeicherte Logins + Sessions je Tenant")
 	fmt.Println()
 	fmt.Println("Plugins / Funktionen:")
 	fns := rt.Functions()

@@ -1,9 +1,12 @@
-// Package session verwaltet Plugin-Credentials pro Plugin-ID.
+// Package session verwaltet Plugin-Credentials pro Tenant und Plugin-ID.
 //
 // Ablage ist eine JSON-Datei mit 0600-Rechten in einem 0700-Verzeichnis,
 // damit ein einmaliges `auth` prozessübergreifend gilt: CLI, REST und MCP
-// teilen sich denselben Store. Sensible Werte (Param.Secret) werden nie
-// geloggt — nur hier abgelegt.
+// teilen sich denselben Store. Das Format ist
+// {"<tenant>": {"<plugin-id>": {"key": "value", ...}}}; ein Alt-Format
+// ohne Tenant-Ebene ({"<plugin-id>": {...}}) wird einmalig unter den
+// Legacy-Tenant "_legacy" migriert. Sensible Werte (Param.Secret) werden
+// nie geloggt — nur hier abgelegt.
 package session
 
 import (
@@ -13,8 +16,11 @@ import (
 	"sync"
 )
 
-// Store hält Credentials je Plugin-ID (thread-safe, file-backed).
-// Das Format ist {"<plugin-id>": {"key": "value", ...}}.
+// LegacyTenant nimmt Credentials aus dem Alt-Format ohne Tenant-Ebene auf.
+const LegacyTenant = "_legacy"
+
+// Store hält Credentials je Tenant und Plugin-ID (thread-safe, file-backed).
+// Das Format ist {"<tenant>": {"<plugin-id>": {"key": "value", ...}}}.
 type Store struct {
 	mu   sync.RWMutex
 	path string
@@ -43,14 +49,15 @@ func NewAtPath(path string) *Store { return &Store{path: path} }
 // Path gibt den Ablagepfad zurück.
 func (s *Store) Path() string { return s.path }
 
-// Get liest die Credentials eines Plugins (ok=false wenn keine existieren).
+// Get liest die Credentials eines Plugins für einen Tenant
+// (ok=false wenn keine existieren).
 // Jede Get liest von Platte (read-through), damit parallele Prozesse
 // (CLI-Aufrufe, REST-Server, MCP-Server) denselben Stand sehen.
-func (s *Store) Get(pluginID string) (map[string]string, bool) {
+func (s *Store) Get(tenant, pluginID string) (map[string]string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	all := s.readLocked()
-	m, ok := all[pluginID]
+	m, ok := all[normalizeTenant(tenant)][pluginID]
 	if !ok || len(m) == 0 {
 		return nil, false
 	}
@@ -61,8 +68,10 @@ func (s *Store) Get(pluginID string) (map[string]string, bool) {
 	return out, true
 }
 
-// Set legt die Credentials eines Plugins ab (leere Werte werden verworfen).
-func (s *Store) Set(pluginID string, creds map[string]string) error {
+// Set legt die Credentials eines Plugins für einen Tenant ab
+// (leere Werte werden verworfen). Der Gesamtstand (inkl. migrierter
+// _legacy-Einträge) wird im neuen Format zurückgeschrieben.
+func (s *Store) Set(tenant, pluginID string, creds map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	all := s.readLocked()
@@ -72,39 +81,106 @@ func (s *Store) Set(pluginID string, creds map[string]string) error {
 			clean[k] = v
 		}
 	}
-	all[pluginID] = clean
+	t := normalizeTenant(tenant)
+	if all[t] == nil {
+		all[t] = map[string]map[string]string{}
+	}
+	all[t][pluginID] = clean
 	return s.writeLocked(all)
 }
 
-// Delete verwirft die Credentials eines Plugins (logout).
-// Nicht existierende Einträge sind kein Fehler.
-func (s *Store) Delete(pluginID string) error {
+// Delete verwirft die Credentials eines Plugins für einen Tenant (logout).
+// Nicht existierende Einträge sind kein Fehler. Nach einer Änderung wird
+// der Gesamtstand (inkl. migrierter _legacy-Einträge) zurückgeschrieben,
+// damit die Datei nach dem ersten Schreibzugriff im neuen Format vorliegt.
+func (s *Store) Delete(tenant, pluginID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	all := s.readLocked()
-	if _, ok := all[pluginID]; !ok {
+	changed := false
+	t := normalizeTenant(tenant)
+	if _, ok := all[t][pluginID]; ok {
+		delete(all[t], pluginID)
+		if len(all[t]) == 0 {
+			delete(all, t)
+		}
+		changed = true
+	}
+	if _, ok := all[LegacyTenant]; ok {
+		changed = true // Alt-Format einmalig ins neue Format überführen
+	}
+	if !changed {
 		return nil
 	}
-	delete(all, pluginID)
 	return s.writeLocked(all)
 }
 
+// normalizeTenant fällt auf den Default-Tenant zurück.
+func normalizeTenant(tenant string) string {
+	if tenant == "" {
+		return "default"
+	}
+	return tenant
+}
+
 // readLocked liest den Gesamtstand (fehlende Datei = leer, kein Fehler).
-func (s *Store) readLocked() map[string]map[string]string {
-	all := map[string]map[string]string{}
+// Ein Alt-Format ohne Tenant-Ebene ({"<plugin-id>": {"k": "v"}}) wird
+// erkannt — json.Unmarshal ins neue Format schlägt dafür fehl bzw. liefert
+// nil-Maps — und unter dem Legacy-Tenant "_legacy" einsortiert.
+func (s *Store) readLocked() map[string]map[string]map[string]string {
+	all := map[string]map[string]map[string]string{}
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		return all
 	}
-	_ = json.Unmarshal(raw, &all)
-	if all == nil {
-		all = map[string]map[string]string{}
+	if err := json.Unmarshal(raw, &all); err == nil && !hasNilLeaf(all) {
+		if all == nil {
+			all = map[string]map[string]map[string]string{}
+		}
+		return all
+	}
+	all = map[string]map[string]map[string]string{}
+	if legacy := sniffLegacyFormat(raw); legacy != nil {
+		all[LegacyTenant] = legacy
 	}
 	return all
 }
 
+// hasNilLeaf erkennt einen fehlgeschlagenen Unmarshal ins 3-Ebenen-Format:
+// json setzt dabei leere (nil) Maps auf der innersten Ebene.
+func hasNilLeaf(all map[string]map[string]map[string]string) bool {
+	for _, plugins := range all {
+		for _, creds := range plugins {
+			if creds == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sniffLegacyFormat erkennt das Alt-Format {"<plugin-id>": {"k": "v"}}
+// und liefert es zurück; sonst nil. Das neue Format
+// {"<tenant>": {"<plugin-id>": {...}}} ergibt konsequent
+// map[string]any-Werte auf der zweiten Ebene und wird nicht verwechselt.
+func sniffLegacyFormat(raw []byte) map[string]map[string]string {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil || len(probe) == 0 {
+		return nil
+	}
+	out := make(map[string]map[string]string, len(probe))
+	for pluginID, v := range probe {
+		var creds map[string]string
+		if err := json.Unmarshal(v, &creds); err != nil {
+			return nil // zweite Ebene ist kein String-Map → neues Format
+		}
+		out[pluginID] = creds
+	}
+	return out
+}
+
 // writeLocked schreibt den Gesamtstand (Verzeichnis 0700, Datei 0600).
-func (s *Store) writeLocked(all map[string]map[string]string) error {
+func (s *Store) writeLocked(all map[string]map[string]map[string]string) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}

@@ -9,6 +9,14 @@ import (
 type Config struct {
 	LogLevel string
 	RestAddr string
+	// RequireTenant verlangt im REST-Adapter einen Tenant-Header für
+	// Plugins mit Login (SC_REQUIRE_TENANT=true). Öffentliche Plugins
+	// (ohne AuthParams) und /healthz + /api-Index bleiben frei.
+	RequireTenant bool
+	// TenantSharedSecret aktiviert optional die HMAC-Signaturprüfung des
+	// Tenant-Headers (SC_TENANT_SHARED_SECRET): X-SC-Tenant-Sig muss dann
+	// HMAC-SHA256(secret, tenant) als Hex sein.
+	TenantSharedSecret string
 	// PluginSecrets hält rohe Credential-Strings je Plugin-ID,
 	// z.B. MEbis_TOKEN, SCHUELERPORTAL_USER ... (Plugins parsen selbst).
 	PluginSecrets map[string]string
@@ -17,9 +25,11 @@ type Config struct {
 // Load liest Env (mit sinnvollen Defaults).
 func Load() Config {
 	return Config{
-		LogLevel:      envOr("LOG_LEVEL", "info"),
-		RestAddr:      envOr("REST_ADDR", ":8080"),
-		PluginSecrets: map[string]string{},
+		LogLevel:           envOr("LOG_LEVEL", "info"),
+		RestAddr:           envOr("REST_ADDR", ":8080"),
+		RequireTenant:      envBool("SC_REQUIRE_TENANT", false),
+		TenantSharedSecret: os.Getenv("SC_TENANT_SHARED_SECRET"),
+		PluginSecrets:      map[string]string{},
 	}
 }
 
@@ -46,4 +56,19 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "true", "TRUE", "True", "yes", "YES", "on", "ON":
+		return true
+	case "0", "false", "FALSE", "False", "no", "NO", "off", "OFF":
+		return false
+	default:
+		return def
+	}
 }
