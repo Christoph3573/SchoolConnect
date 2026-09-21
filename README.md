@@ -147,6 +147,17 @@ Echter Zugriff auf `https://lernplattform.bycs.de` (Keycloak-SSO via
 `fetch` lädt Datei-Module (`resource`, auch via `--url`); Verzeichnisse
 (`folder`) listen ihre Dateien — dann per `--datei <name>` eine wählen.
 
+```bash
+/tmp/schoolconnect tool mebis eintrag --modul 77848858 --text "Meine Notizen ..."
+/tmp/schoolconnect tool mebis h5p-abschliessen --modul 77849530
+```
+
+`eintrag` schreibt/aktualisiert einen Tagebuch-Eintrag (`mod_journal`, kein
+stabiler Webservice — postet wie ein Browser-Submit gegen `edit.php`).
+`h5p-abschliessen` sendet für eine H5P.DragQuestion-Zuordnungsaufgabe eine
+perfekte Musterlösung an `setFinished` (Abschlussvoraussetzung "Eine
+Bewertung erhalten"); andere H5P-Typen werden abgelehnt.
+
 ### bycs-drive: ByCS Drive (Dateicloud)
 
 Echter Zugriff auf `https://<host>` (ownCloud OCIS, z.B.
