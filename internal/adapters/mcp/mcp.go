@@ -64,6 +64,7 @@ func (s *Server) ServeSTDIO(ctx context.Context) {
 		case "initialize":
 			out.Encode(rsp(req.ID, map[string]any{
 				"protocolVersion": "2024-11-05",
+				"capabilities":    map[string]any{"tools": map[string]any{}},
 				"serverInfo":      map[string]any{"name": "schoolconnect", "version": "0.1.0"},
 			}))
 		case "tools/list":
